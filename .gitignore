@@ -1,0 +1,14 @@
+# 验证脚本用的临时浏览器配置（每次运行都会重建，体积大）
+dev/*-profile/
+dev/*-profile-*/
+
+# 生成物与运行日志
+dev/e2e-build/
+dev/edge-out.txt
+dev/e2e-diag.json
+*.log
+*.tmp
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
