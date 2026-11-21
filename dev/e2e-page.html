@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>假 DeepSeek（端到端：真扩展注入 + 真 fetch/XHR 拦截）</title>
+<style>
+  body { margin: 0; font-family: Inter, "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; background: #f4f5f7; color: #1f232b; }
+  #chat { max-width: 620px; margin: 0 auto; padding: 24px 16px 80px; }
+  h2 { font-size: 15px; color: #6a7280; font-weight: 600; }
+  .ds-message { margin: 14px 0; padding: 12px 14px; border-radius: 12px; background: #fff; border: 1px solid #e3e7ee; }
+  .ds-user-message { background: #eef3ff; margin-left: 90px; }
+  .ds-assistant-message { margin-right: 60px; }
+  .who { font-size: 11px; color: #8b93a3; margin-bottom: 4px; }
+  .ds-markdown { font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+  #net { font-size: 12px; color: #6a7280; }
+</style>
+</head>
+<body>
+<div id="chat">
+  <h2>假 DeepSeek 对话页（页面里没有任何插件代码，全靠扩展注入）</h2>
+  <p id="net">正在请求 /api/v0/chat/history_messages …</p>
+</div>
+<script>
+var QS = new URLSearchParams(location.search);
+var CHAT_ID = (location.pathname.match(/\/(?:chain|s|c)\/([0-9a-zA-Z_-]{6,})/) || [])[1] || 'a1b2c3d4-e5f6-4711-8899-aabbccddeeff';
+// 线上实测到的坑：页面最后一次发历史请求用的是**上一条对话**的 ID（切了会话但走本地缓存、不再发请求）。
+var STALE_ID = '79d6eb2e-df9f-4f0c-be3c-e0d31a17ec2d';
+var FAKE_JWT = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlMmUiLCJleHAiOjE3OTAwMDAwMDB9.c2lnX3ZhbHVlX2lzX25vdF9yZWFs';
+
+function text(m) {
+  // 线上真结构：正文在 fragments 里，提问是 REQUEST、回答正文是 RESPONSE（THINK/检索结果页面不进气泡正文）
+  var fr = m.fragments || [];
+  var out = [];
+  for (var i = 0; i < fr.length; i++) {
+    var f = fr[i];
+    if (!f || (f.type !== 'text' && f.type !== 'REQUEST' && f.type !== 'RESPONSE')) continue;
+    var s = typeof f.content === 'string' ? f.content : (typeof f.text === 'string' ? f.text : '');
+    if (s) out.push(s);
+  }
+  return out.join('\n\n');
+}
+
+// 页面只画「当前路径」上的那几版：从 chat_session.current_message_id 沿 parent_id 往上
+function activeChain(copy) {
+  var byId = {}, list = copy.data.biz_data.chat_messages;
+  list.forEach(function (m) { byId[m.message_id] = m; });
+  var out = [], n = byId[copy.data.biz_data.chat_session.current_message_id], guard = 0;
+  while (n && guard++ < list.length) { out.unshift(n); n = byId[n.parent_id]; }
+  return out;
+}
+
+// DOM 结构照抄线上 class：外层只有 ds-message + 哈希类，角色写在内层 ds-*-message-main-content
+function render(messages, note) {
+  document.getElementById('net').textContent = note;
+  var chat = document.getElementById('chat');
+  messages.forEach(function (m) {
+    var bot = m.role !== 'user';
+    var box = document.createElement('div');
+    box.className = 'ds-message d29f3d7d ' + (bot ? 'ds-assistant-message' : 'ds-user-message');
+    var main = document.createElement('div');
+    main.className = bot ? 'ds-assistant-message-main-content' : 'ds-user-message-main-content';
+    var who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = bot ? 'DeepSeek' : '你';
+    var b = document.createElement('div');
+    b.className = 'ds-markdown';
+    b.textContent = text(m);
+    main.appendChild(who);
+    main.appendChild(b);
+    box.appendChild(main);
+    chat.appendChild(box);
+  });
+}
+
+function regenerate() {
+  // 线上一模一样：重新生成走 XHR，返回 text/event-stream
+  var x = new XMLHttpRequest();
+  x.open('POST', '/api/v0/chat/regenerate');
+  x.setRequestHeader('content-type', 'application/json');
+  x.setRequestHeader('Authorization', 'Bearer ' + FAKE_JWT);
+  x.send(JSON.stringify({ chat_session_id: CHAT_ID, parent_message_id: 102 }));
+  document.getElementById('net').textContent += ' | 已发过一次「重新生成」（流式返回）。';
+}
+
+// 线上第四轮事故的那一步：客户端配置（模型列表 + 提示词模板）也走 XHR、也带鉴权头，
+// 条目形如 {id:number, type:'REQUEST', content:'…'}，id 与 message_id 同一套编号。
+function loadSettings() {
+  var x = new XMLHttpRequest();
+  x.open('GET', '/api/v0/client/settings?scope=model');
+  x.setRequestHeader('Authorization', 'Bearer ' + FAKE_JWT);
+  x.send();
+}
+setTimeout(loadSettings, 1200);
+
+// 页面渲染用的是本地副本（真实站点是 IndexedDB 缓存），不在 /api/ 下，所以劫持层看不见这份数据
+fetch('/cached-copy.json').then(function (r) { return r.json(); }).then(function (copy) {
+  if (QS.get('nofetch')) {
+    // 这个变体一个 /api/ 请求都不发，只把登录态放在 localStorage —— 用来验「复用页面鉴权」的第二条路：翻 localStorage 找 JWT
+    localStorage.setItem('settingsJwt', FAKE_JWT);
+    render(activeChain(copy), '这个变体不发任何 /api/ 请求（?nofetch=1）：页面照样画出气泡，插件只能靠翻 localStorage 拿到登录态去重抓。');
+    setTimeout(regenerate, 5000);
+    return;
+  }
+  fetch('/api/v0/chat/history_messages?chat_session_id=' + STALE_ID + '&cache_version=718&cache_reset_at=1793378075',
+        { headers: { 'Authorization': 'Bearer ' + FAKE_JWT } })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      var got = (j.data && j.data.biz_data && j.data.biz_data.chat_messages && j.data.biz_data.chat_messages.length) || 0;
+      render(activeChain(copy), '页面自己那次 history_messages 只回了 ' + got + ' 条（命中缓存、而且会话 ID 还是上一条对话的 ' + STALE_ID.slice(0, 8) + '…），气泡来自本地副本。');
+    })
+    .catch(function (e) { render(activeChain(copy), '接口请求失败：' + e); });
+  setTimeout(regenerate, 5000);
+});
+
+// ?demo=diag：等插件自动重抓 + 流式摄取都跑完，点抽屉里的「诊断」，把整份报告回传给验证脚本落盘
+if (QS.get('demo') === 'diag') {
+  setTimeout(function () {
+    var host = document.getElementById('dst-host');
+    if (!host) { fetch('/report', { method: 'POST', body: 'NO #dst-host：扩展没注入' }); return; }
+    var btn = host.querySelector('[data-act="diag"]');
+    if (!btn) { fetch('/report', { method: 'POST', body: 'NO diag button' }); return; }
+    btn.click();
+    var tries = 0;
+    var poll = setInterval(function () {
+      var s = host.querySelector('.dst-status');
+      var txt = s ? s.textContent : '';
+      if (/^诊断信息/.test(txt) || ++tries > 40) {
+        clearInterval(poll);
+        fetch('/report', { method: 'POST', body: txt });
+      }
+    }, 150);
+  }, 7000);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>线上形态复刻：虚拟滚动 + 哈希类名翻页器</title>
+<link rel="stylesheet" href="../src/drawer.css">
+<style>
+  body { margin: 0; font-family: Inter, "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; background: #f4f5f7; color: #1f232b; }
+  #chat { max-width: 620px; margin: 0 auto; padding: 18px 16px; }
+  #list { height: 640px; overflow-y: auto; border: 1px solid #dfe3ea; border-radius: 10px; background: #fff; }
+  ._63c77b1 { padding: 10px 14px; border-bottom: 1px solid #eef1f5; }
+  .ds-message { display: block; }
+  .ds-assistant-message-main-content { display: block; }
+  .d29f3d7d { display: block; }
+  .ds-markdown { font-size: 14px; line-height: 1.55; white-space: pre-wrap; }
+  ._think { font-size: 12px; color: #8b93a3; margin-bottom: 4px; }
+  ._acts { font-size: 11px; color: #a0a7b4; margin-top: 6px; }
+  ._17e14c5._6fbd7d4 { display: flex; gap: 10px; align-items: center; justify-content: flex-end; margin-top: 6px; font-size: 12px; color: #6a7280; }
+  ._x, ._y, ._z { display: flex; align-items: center; }
+  ._a1b2c3d { width: 20px; height: 20px; line-height: 20px; text-align: center; border-radius: 4px; background: #f2f4f7; cursor: pointer; user-select: none; }
+  ._9f8e7d6 { padding: 0 2px; }
+  #hint { position: fixed; left: 16px; bottom: 12px; font-size: 12px; color: #6a7280; max-width: 46vw; }
+</style>
+</head>
+<body>
+<div id="chat">
+  <div id="list"><div id="top"></div><div id="bubbles"></div><div id="bot"></div></div>
+</div>
+<div id="hint">虚拟滚动复刻：23 条消息，页面一次只渲染 6 个气泡；往上滚才加载更早的历史。</div>
+
+<script>
+window.onerror = function (m, src, line) {
+  var h = document.getElementById('hint');
+  if (h) h.textContent = 'JS 错误：' + m + ' @' + (src || '').split('/').pop() + ':' + line;
+  return false;
+};
+</script>
+<script src="../src/model.js"></script>
+<script src="../src/layout.js"></script>
+<script src="../src/drawer.js"></script>
+<script src="../src/content.js"></script>
+<script>
+// ---------- 数据：11 轮对话，第 2 轮回答有 2 个版本（第 1 版是死支） ----------
+function frag(id, type, content) { return { id: id, type: type, content: content }; }
+function msg(id, parent, role, inserted, body) {
+  return {
+    message_id: id, parent_id: parent, model: role === 'user' ? '' : 'deepseek-chat', role: role,
+    thinking_enabled: role === 'assistant', ban_edit: false, ban_regenerate: false, status: 'finished',
+    incomplete_message: null, accumulated_token_usage: 0, feedback: null, inserted_at: inserted,
+    search_enabled: false,
+    fragments: [frag(id * 10, role === 'user' ? 'REQUEST' : 'RESPONSE', body)],
+    has_pending_fragment: false, auto_continue: false, search_triggered: false, extra_search_providers: []
+  };
+}
+
+var TEXT = {};
+var DATA = [];
+function addTurn(t, parentAssistant) {
+  var uid = 100 + t * 10, aid = uid + 1;
+  var uText = '第 ' + t + ' 轮提问：请把上一轮说的并发池再讲细一点，我要能直接照着写代码。';
+  var aText = '第 ' + t + ' 轮回答：这里给出实现要点和可以直接运行的示例，重点看限流、异常回收和结果收集这三段。';
+  TEXT[uid] = uText; TEXT[aid] = aText;
+  DATA.push(msg(uid, parentAssistant, 'user', 1730000000 + t * 100, uText));
+  DATA.push(msg(aid, uid, 'assistant', 1730000000 + t * 100 + 1, aText));
+  return aid;
+}
+
+// 第 1、2 轮
+var a1 = addTurn(1, null);
+var u2 = 120;
+var a2v1Text = '第 2 轮回答（第 1 版）：只给了一个最简版：用 channel 当信号量，提交前取令牌，结束再归还。';
+var a2v2Text = '第 2 轮回答（第 2 版）：完整版：Worker 池 + channel 限流 + defer recover 转 error，Wait 收口。';
+TEXT[u2] = '第 2 轮提问：请把上一轮说的并发池再讲细一点，我要能直接照着写代码。';
+TEXT[1021] = a2v1Text; TEXT[1022] = a2v2Text;
+DATA.push(msg(u2, a1, 'user', 1730000200, TEXT[u2]));
+DATA.push(msg(1021, u2, 'assistant', 1730000201, a2v1Text));
+DATA.push(msg(1022, u2, 'assistant', 1730000202, a2v2Text));
+
+var prevA = 1022;
+for (var t = 3; t <= 11; t++) prevA = addTurn(t, prevA);
+
+var HISTORY = {
+  code: 0, msg: '',
+  data: {
+    biz_code: 0, biz_msg: '',
+    biz_data: {
+      chat_session: {
+        id: 'virtual-scroll-demo-0001', title: '虚拟滚动复刻', title_type: 'auto', model_type: 'deepseek',
+        pinned: false, updated_at: 1730001200, seq_id: 11, agent: 'chat', version: 1, is_empty: false,
+        current_message_id: prevA, inserted_at: 1729999000
+      },
+      chat_messages: DATA,
+      cache_control: 'local'
+    }
+  }
+};
+
+// ---------- 当前这条线：第 2 轮选中哪一版，决定下面还长不长 ----------
+var SEL = { 2: 1 };   // 1 = a2v2（页面当前显示）
+function lineIds() {
+  var out = [110, 111, u2];
+  out.push(SEL[2] === 1 ? 1022 : 1021);
+  if (SEL[2] === 1) {
+    for (var i = 3; i <= 11; i++) out.push(100 + i * 10, 100 + i * 10 + 1);
+  }
+  return out;
+}
+
+// ---------- 虚拟滚动：一次只渲染 6 个，往上滚换更早的一段 ----------
+var WINDOW = 6, STEP = 6, start = 0, loads = 0, cooling = false;
+var ROW_H = 96;
+var list = document.getElementById('list');
+var topEl = document.getElementById('top');
+var botEl = document.getElementById('bot');
+var boxEl = document.getElementById('bubbles');
+
+function bubbleEl(id) {
+  var role = id % 10 === 0 ? 'user' : 'assistant';
+  var row = document.createElement('div');
+  row.className = '_63c77b1';
+  var m = document.createElement('div');
+  m.className = 'ds-message';
+  var inner = document.createElement('div');
+  inner.className = role === 'assistant' ? 'ds-assistant-message-main-content' : 'd29f3d7d';
+  var md = document.createElement('div');
+  md.className = 'ds-markdown';
+  md.textContent = TEXT[id];
+  if (role === 'assistant') {
+    var th = document.createElement('div');
+    th.className = '_think';
+    th.textContent = '已深度思考（用时 12 秒）';
+    inner.appendChild(th);
+  }
+  inner.appendChild(md);
+  if (role === 'assistant') {
+    var acts = document.createElement('div');
+    acts.className = '_acts';
+    acts.textContent = '复制 重新生成';
+    inner.appendChild(acts);
+  }
+  m.appendChild(inner);
+  row.appendChild(m);
+  return { row: row, message: m, inner: inner, body: md };
+}
+
+// 线上翻页器：哈希类名、普通 div、没有 role/tabindex，只有 cursor:pointer
+function pagerEl(box, idx, total, onPrev, onNext) {
+  var p = document.createElement('div');
+  p.className = '_17e14c5 _6fbd7d4';
+  var x = document.createElement('div'); x.className = '_x';
+  var prev = document.createElement('div'); prev.className = '_a1b2c3d'; prev.textContent = '‹';
+  x.appendChild(prev);
+  var y = document.createElement('div'); y.className = '_y';
+  var label = document.createElement('span'); label.className = '_9f8e7d6';
+  label.textContent = (idx + 1) + ' / ' + total;
+  y.appendChild(label);
+  var z = document.createElement('div'); z.className = '_z';
+  var next = document.createElement('div'); next.className = '_a1b2c3d'; next.textContent = '›';
+  z.appendChild(next);
+  p.appendChild(x); p.appendChild(y); p.appendChild(z);
+  prev.addEventListener('click', onPrev);
+  next.addEventListener('click', onNext);
+  box.appendChild(p);
+  return { label: label };
+}
+
+function render(keepBottom) {
+  var ids = lineIds();
+  start = Math.max(0, Math.min(start, Math.max(0, ids.length - WINDOW)));
+  var slice = ids.slice(start, start + WINDOW);
+  topEl.style.height = (start * ROW_H) + 'px';
+  botEl.style.height = ((ids.length - start - slice.length) * ROW_H) + 'px';
+  boxEl.innerHTML = '';
+  slice.forEach(function (id) {
+    var r = bubbleEl(id);
+    if (id === 1021 || id === 1022) {
+      var idx = SEL[2];
+      pagerEl(r.message, idx, 2,
+        function () { if (SEL[2] > 0) { SEL[2]--; start = 0; render(); } },
+        function () { if (SEL[2] < 1) { SEL[2]++; start = 999; render(); } });
+    }
+    boxEl.appendChild(r.row);
+  });
+  if (keepBottom) list.scrollTop = list.scrollHeight;
+  document.getElementById('hint').textContent = 'VIRT 窗口 ' + start + '..' + (start + slice.length - 1) +
+    ' / 共 ' + ids.length + '；已加载 ' + loads + ' 次；页面这条线：' + ids.join(' → ');
+  window.__VIRT__ = { start: start, loads: loads, total: ids.length, line: ids.slice() };
+}
+window.__LINE__ = function () { return lineIds().join(','); };
+window.__BUBBLES__ = function () {
+  return Array.prototype.map.call(document.querySelectorAll('#bubbles .ds-markdown'), function (e) { return e.textContent; });
+};
+
+list.addEventListener('scroll', function () {
+  if (cooling) return;
+  if (list.scrollTop < 14 && start > 0) {
+    cooling = true;
+    start = Math.max(0, start - STEP);
+    loads++;
+    render();
+    list.scrollTop = 140;   // 别停在顶端，否则下一次 set scrollTop=0 不会产生滚动
+    setTimeout(function () { cooling = false; }, 260);
+  }
+});
+
+start = Math.max(0, lineIds().length - WINDOW);
+render(true);
+
+// 走和真实环境一样的注入通道
+setTimeout(function () {
+  window.postMessage({
+    __dst: 1,
+    channel: '__dst_capture__',
+    rec: {
+      kind: 'fetch',
+      url: 'https://chat.deepseek.com/api/v0/chat/history_messages?chat_session_id=virtual-scroll-demo-0001',
+      method: 'GET', status: 200, ct: 'application/json', hits: 1, at: Date.now(),
+      body: JSON.stringify(HISTORY)
+    }
+  }, '*');
+}, 300);
+</script>
+</body>
+</html>

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>离线验证：假 DeepSeek 页面 + 真插件脚本</title>
+<link rel="stylesheet" href="../src/drawer.css">
+<style>
+  body { margin: 0; font-family: Inter, "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; background: #f4f5f7; color: #1f232b; }
+  #chat { max-width: 620px; margin: 0 auto; padding: 24px 16px 120px; }
+  h2 { font-size: 15px; color: #6a7280; font-weight: 600; }
+  .msg { margin: 14px 0; padding: 12px 14px; border-radius: 12px; background: #fff; border: 1px solid #e3e7ee; }
+  .msg.is-user { background: #eef3ff; margin-left: 90px; }
+  .msg.is-bot { margin-right: 60px; }
+  .who { font-size: 11px; color: #8b93a3; margin-bottom: 4px; }
+  .ds-markdown { font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 8px; font-size: 12px; color: #6a7280; }
+  .pager button { width: 22px; height: 22px; border: 1px solid #dfe3ea; background: #fff; border-radius: 6px; cursor: pointer; }
+  #hint { position: fixed; left: 16px; bottom: 12px; font-size: 12px; color: #6a7280; max-width: 40vw; }
+</style>
+</head>
+<body>
+<div id="chat">
+  <h2>模拟的 DeepSeek 对话页（只画「当前显示的那一版」，旧版本在数据里）</h2>
+</div>
+<div id="hint">插件脚本（model / layout / drawer / content）都是正式版同一份代码；数据通过和真实注入层一样的 postMessage 通道喂进来。</div>
+
+<script>
+// 验证用探针：把插件脚本抛出的异常显式打到页面上，免得只看到「没有节点」却不知道为什么
+window.onerror = function (m, src, line) {
+  var h = document.getElementById('hint');
+  if (h) h.textContent = 'JS 错误：' + m + ' @' + (src || '').split('/').pop() + ':' + line;
+  return false;
+};
+// ?dark=1：把宿主页面染黑，让 content.js 的自动主题判定切到 dst-dark，好用截图核对深色 token
+var Q = new URLSearchParams(location.search);
+if (Q.get('dark')) {
+  document.body.style.background = '#101215';
+  document.documentElement.style.background = '#101215';
+}
+</script>
+<script src="../dev/fixture.js"></script>
+<script src="../src/model.js"></script>
+<script src="../src/layout.js"></script>
+<script src="../src/drawer.js"></script>
+<script src="../src/content.js"></script>
+<script>
+// ---- 造一个和 DeepSeek 行为一致的气泡区：只显示当前路径，旧版藏在数据里 ----
+var M = {};
+FIXTURE_HISTORY.data.messages.forEach(function (m) { M[m.unique_id] = m; });
+var VERSIONS_A3 = ['a3v1', 'a3v2', 'a3v3'];
+M.a3v3 = { unique_id: 'a3v3', parent_message_id: 'u3', role: 'assistant', content: { text: '补测试前先给 Pool 加 WithTimeout，用例还是那三个，外加一个超时用例。' }, create_time: 1730000620, is_not_last_displayed: false };
+// 详情面板要能撑起来：给第 1 版换成一份真实长度的多段回答（只影响 mock 页，fixture.js 与单测不动）
+M.a3v1.content.text = [
+  '补测试分三步，用例名建议按行为拆：限流、异常转错误、结果有序，再加一个超时用例。',
+  '',
+  '1）限流：用 atomic.AddInt32 记当前在跑的任务数，每提交一个任务前取一个 channel 令牌，任务结束再归还；断言整轮跑完峰值计数 <= N。跑法记得带 -race。',
+  '',
+  '2）异常转错误：在 worker 循环里 defer recover()，把 recover 到的值包成 fmt.Errorf 塞进 errs，Wait() 时用 errors.Join 汇总，别让一个坏任务把池子拖死。',
+  '',
+  '3）结果有序：Submit 时记下序号，Result[T] 里带上 index，收口后按 index 排序再断言，避免并发完成顺序影响测试稳定性。',
+  '',
+  '超时那一个：给 Pool 加 WithTimeout(d)，Wait() 超过 d 返回 context.DeadlineExceeded，用 httptest 起一个故意 sleep 的假服务来触发。'
+].join('\n');
+// 页面上现在显示的是第 3 版，所以第 2 版在数据里也算被隐藏
+M.a3v2.is_not_last_displayed = true;
+FIXTURE_HISTORY.data.messages.push(M.a3v3);
+
+var DISPLAYED = ['u1', 'a1v3', 'u2b', 'a2b', 'u3', 'a3v3'];
+function textOf(m) {
+  if (typeof m.content === 'string') return m.content;
+  if (Array.isArray(m.content)) return m.content.map(function (c) { return c.text; }).join('');
+  return m.content.text;
+}
+function bubble(m) {
+  var box = document.createElement('div');
+  box.className = 'msg ' + (m.role === 'user' ? 'is-user' : 'is-bot');
+  box.id = 'msg-' + m.unique_id;
+  var who = document.createElement('div');
+  who.className = 'who';
+  who.textContent = m.role === 'user' ? '你' : 'DeepSeek';
+  var b = document.createElement('div');
+  b.className = 'ds-markdown';
+  b.dataset.slot = m.unique_id;
+  b.textContent = textOf(m);
+  box.appendChild(who);
+  box.appendChild(b);
+  return { box: box, body: b };
+}
+function pagerFor(r, slot, total) {
+  var p = document.createElement('div');
+  p.className = 'pager';
+  var prev = document.createElement('button'); prev.textContent = '‹';
+  var label = document.createElement('span');
+  var next = document.createElement('button'); next.textContent = '›';
+  p.appendChild(prev); p.appendChild(label); p.appendChild(next);
+  label.textContent = (slot + 1) + '/' + total;
+  r.box.appendChild(p);
+  return { prev: prev, next: next, label: label };
+}
+
+// ---- ?branch=1：页面渲染成"整条线由每一轮选中的版本决定"，用来验「跳到这条分支」 ----
+// 拓扑照 fixture：a1 有 3 版（只有第 3 版往下长）、u2 是被编辑过的 2 版提问，两条支线各自往下长
+var TURNS = {
+  t_u1: { versions: [{ id: 'u1', next: 't_a1' }] },
+  t_a1: { versions: [{ id: 'a1v1', next: null }, { id: 'a1v2', next: null }, { id: 'a1v3', next: 't_u2' }] },
+  t_u2: { versions: [{ id: 'u2a', next: 't_a2a' }, { id: 'u2b', next: 't_a2b' }] },
+  t_a2a: { versions: [{ id: 'a2a', next: null }] },
+  t_a2b: { versions: [{ id: 'a2b', next: 't_u3' }] },
+  t_u3: { versions: [{ id: 'u3', next: 't_a3' }] },
+  t_a3: { versions: [{ id: 'a3v1', next: null }, { id: 'a3v2', next: null }, { id: 'a3v3', next: null }] }
+};
+var SEL = { t_a1: 2, t_u2: 1, t_a3: 2 };
+var SLOTS = null;
+// &subtree=0：模拟另一种实现——切版本只换那一个气泡，下面这条线不动（更难的情况，看插件怎么交代）
+var SUBTREE = Q.get('subtree') !== '0';
+function lineOf() {
+  var out = [], t = 't_u1', guard = 0;
+  while (t && guard++ < 40) {
+    var turn = TURNS[t], i = Math.min(SEL[t] || 0, turn.versions.length - 1);
+    out.push({ turn: t, idx: i, id: turn.versions[i].id });
+    t = turn.versions[i].next;
+  }
+  return out;
+}
+function currentSlots() {
+  if (SUBTREE) return lineOf();
+  if (!SLOTS) SLOTS = lineOf();
+  return SLOTS;
+}
+function renderBranchPage(note) {
+  var chat = document.getElementById('chat');
+  Array.prototype.slice.call(chat.querySelectorAll('.msg')).forEach(function (e) { e.remove(); });
+  var slots = currentSlots();
+  slots.forEach(function (slot) {
+    var turn = TURNS[slot.turn], r = bubble(M[slot.id]);
+    if (turn.versions.length > 1) {
+      var pg = pagerFor(r, slot.idx, turn.versions.length);
+      pg.prev.addEventListener('click', function () { moveTurn(slot.turn, slot.idx - 1); });
+      pg.next.addEventListener('click', function () { moveTurn(slot.turn, slot.idx + 1); });
+    }
+    chat.appendChild(r.box);
+  });
+  document.getElementById('hint').textContent = (note || 'BRANCH') + ' 页面这条线：' +
+    slots.map(function (s) { return s.id; }).join(' → ') +
+    (SUBTREE ? '（切一版连带下面整条线重渲染）' : '（切一版只换那一个气泡）');
+}
+function moveTurn(turn, idx) {
+  if (idx < 0 || idx >= TURNS[turn].versions.length) return;
+  SEL[turn] = idx;
+  if (!SUBTREE) {
+    currentSlots().forEach(function (s) { if (s.turn === turn) { s.idx = idx; s.id = TURNS[turn].versions[idx].id; } });
+  }
+  renderBranchPage();
+}
+
+if (Q.get('branch')) {
+  renderBranchPage('初始');
+} else {
+  DISPLAYED.forEach(function (id) {
+    var m = M[id];
+    var r = bubble(m);
+    if (id === 'a3v3') {
+      // 这一处回答有 3 个版本，页面只显示第 3 版，并给出 ‹ 3/3 › 切换器
+      var idx = 2;
+      var pg = pagerFor(r, idx, VERSIONS_A3.length);
+      function show() { r.body.textContent = textOf(M[VERSIONS_A3[idx]]); pg.label.textContent = (idx + 1) + '/' + VERSIONS_A3.length; }
+      pg.prev.addEventListener('click', function () { if (idx > 0) { idx--; show(); } });
+      pg.next.addEventListener('click', function () { if (idx < VERSIONS_A3.length - 1) { idx++; show(); } });
+    }
+    document.getElementById('chat').appendChild(r.box);
+  });
+}
+
+// ?big=N：往这条对话后面接 N 轮（每轮 1 问 + 3 版答），造出"改了上百次"的大树，
+// 用来验小缩放下的渲染会不会塌（线上真实会话的节点数远超内置那 13 条）
+if (Q.get('big')) {
+  var NBIG = parseInt(Q.get('big'), 10) || 100;
+  var bigPrev = 'a3v3';
+  for (var bg = 0; bg < NBIG; bg++) {
+    var buid = 'bu' + bg;
+    FIXTURE_HISTORY.data.messages.push({
+      unique_id: buid, parent_message_id: bigPrev, role: 'user',
+      content: { text: '第 ' + (bg + 1) + ' 轮提问：这里塞一段够长的中文正文用来撑满节点宽度，看它排版时会不会溢出。' },
+      create_time: 1730000700 + bg * 30
+    });
+    for (var bv = 0; bv < 3; bv++) {
+      FIXTURE_HISTORY.data.messages.push({
+        unique_id: 'ba' + bg + 'v' + bv, parent_message_id: buid, role: 'assistant',
+        content: { text: '第 ' + (bg + 1) + ' 轮的第 ' + (bv + 1) + ' 版回答：Worker 池 + channel 限流，defer recover 转 error，Wait 收口。' },
+        create_time: 1730000700 + bg * 30 + bv + 1
+      });
+    }
+    bigPrev = 'ba' + bg + 'v2';
+  }
+}
+
+// ---- 走和真实环境一样的通道喂数据 ----
+setTimeout(function () {
+  window.postMessage({
+    __dst: 1,
+    channel: '__dst_capture__',
+    rec: {
+      kind: 'fetch',
+      url: 'https://chat.deepseek.com/api/v0/chat/history_messages?chat_id=' + FIXTURE_HISTORY.data.chat_id + '&show_all=false',
+      method: 'GET', status: 200, ct: 'application/json', hits: 1, at: Date.now(),
+      body: JSON.stringify(FIXTURE_HISTORY)
+    }
+  }, '*');
+}, 300);
+
+// 0.1.14 起插件进页面默认折叠；mock 里的演示/取证脚本都假设面板已是展开的，这里替它们先点开
+if (new URLSearchParams(location.search).get('probe') || new URLSearchParams(location.search).get('demo')) {
+  setTimeout(function () {
+    var t = document.querySelector('#dst-host .dst-tab');
+    if (t && !t.classList.contains('is-hidden')) t.click();
+  }, 600);
+}
+
+// ?probe=1：把「节点字号 × 画布缩放 = 屏幕上真实像素高」写进左下角，作为「字为什么糊」的数值证据
+if (new URLSearchParams(location.search).get('probe')) {
+  setTimeout(function () {
+    var host = document.getElementById('dst-host');
+    var c = host.querySelector('.dst-card');
+    var inn = host.querySelector('.dst-inner');
+    var k = parseFloat(getComputedStyle(inn).transform.match(/matrix\(([\d.]+)/)[1]);
+    var fs = parseFloat(getComputedStyle(c.querySelector('.dst-card-prev') || c).fontSize);
+    var r = c.getBoundingClientRect();
+    document.getElementById('hint').textContent =
+      'PROBE 字号 ' + fs + 'px × 缩放 ' + k.toFixed(3) + ' = 屏幕上 ' + (fs * k).toFixed(2) + 'px；节点框实测高 ' + r.height.toFixed(1) + 'px（宽 ' + r.width.toFixed(1) + 'px）';
+  }, 1600);
+}
+
+// ---- 截图取证用的演示开关：?demo=detail / reveal / search ----
+if (Q.get('demo')) {
+  setTimeout(function () {
+    var host = document.getElementById('dst-host');
+    function card(id) { return host.querySelector('.dst-card[data-id="' + id + '"]'); }
+    function footBtn(label) {
+      return Array.prototype.find.call(host.querySelectorAll('.dst-detail-foot .dst-btn'), function (b) { return b.textContent === label; });
+    }
+    if (Q.get('demo') === 'search') {
+      var s = host.querySelector('.dst-search');
+      s.value = 'panic';
+      s.dispatchEvent(new Event('input'));
+    }
+    if (Q.get('demo') === 'pan') {
+      // 拖一下画布，把变换量和「拖动后第一次点击被吞」写进左下角，作为「能平移」的硬证据
+      var cv = host.querySelector('.dst-canvas');
+      var inn = host.querySelector('.dst-inner');
+      function pe(type, x, y) {
+        cv.dispatchEvent(new PointerEvent(type, {
+          pointerId: 7, pointerType: 'mouse', button: 0, buttons: type === 'pointerup' ? 0 : 1,
+          clientX: x, clientY: y, bubbles: true, cancelable: true
+        }));
+      }
+      var before = inn.style.transform;
+      pe('pointerdown', 1620, 300);
+      pe('pointermove', 1730, 350);
+      pe('pointermove', 1810, 390);
+      pe('pointerup', 1810, 390);
+      var after = inn.style.transform;
+      var card = host.querySelector('.dst-card');
+      card.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      var swallowed = getComputedStyle(host.querySelector('.dst-detail')).display === 'none';
+      setTimeout(function () {
+        document.getElementById('hint').textContent =
+          '平移前 [' + before + '] → 平移后 [' + after + ']；拖动后紧跟的第一次点击被吞掉（详情面板没开）= ' + swallowed;
+      }, 60);
+    }
+    if (Q.get('demo') === 'wheel') {
+      // 滚轮缩放：证明 ① 普通滚轮就能缩放 ② 没有 30%/200% 的上下限 ③ 最后停在整 50% 好和旧图对比清晰度
+      var cv2 = host.querySelector('.dst-canvas');
+      var lab = host.querySelector('.dst-zlabel');
+      function wheel(dy) {
+        cv2.dispatchEvent(new WheelEvent('wheel', { deltaY: dy, clientX: 1600, clientY: 500, bubbles: true, cancelable: true }));
+      }
+      var start = lab.textContent;
+      var nUp = 6, nDown = 15, i;
+      for (i = 0; i < nUp; i++) wheel(-100);
+      var zoomedIn = lab.textContent;
+      for (i = 0; i < nDown; i++) wheel(100);
+      var zoomedOut = lab.textContent;
+      // ?demo=wheel&hold=1：就停在 24%，拍「滚轮能一路缩到远低于旧的 30% 下限、整棵树一次看全」
+      if (new URLSearchParams(location.search).get('hold')) {
+        setTimeout(function () {
+          document.getElementById('hint').textContent =
+            '滚轮起始 [' + start + '] → 上滚 ' + nUp + ' 下 [' + zoomedIn + '] → 下滚 ' + nDown + ' 下 [' + zoomedOut + ']（旧版这里会被卡在 200% / 30%，所以这张图拍不出来）';
+        }, 60);
+        return;
+      }
+      // 用真实的缩放系数（matrix 的 a）而不是标签上四舍五入过的百分比，才能正好落在 50%
+      var cur = parseFloat(getComputedStyle(host.querySelector('.dst-inner')).transform.match(/matrix\(([\d.]+)/)[1]);
+      wheel(-Math.log(0.5 / cur) / 0.0016);
+      var half = lab.textContent;
+      setTimeout(function () {
+        document.getElementById('hint').textContent =
+          '滚轮起始 [' + start + '] → 上滚 ' + nUp + ' 下 [' + zoomedIn + '] → 下滚 ' + nDown + ' 下 [' + zoomedOut + '] → 回到 [' + half + ']（上下限已去掉；画布停在 50% 用于比对清晰度）';
+      }, 60);
+    }
+    if (Q.get('demo') === 'detail') { card('a3v1').click(); }
+    if (Q.get('demo') === 'reveal') {
+      card('a3v1').click();
+      setTimeout(function () { footBtn('切到这一版').click(); }, 500);
+    }
+    if (Q.get('demo') === 'branch') {
+      // 点旧支线上的 a2a（它的上一轮提问是被编辑掉的那一版），看插件是否把页面上整条线都换过来
+      function lineNow() {
+        return Array.prototype.map.call(document.querySelectorAll('#chat .ds-markdown'), function (e) { return e.dataset.slot; }).join(' → ');
+      }
+      var before = lineNow();
+      card('a2a').click();
+      setTimeout(function () { footBtn('切到这一版').click(); }, 500);
+      setTimeout(function () {
+        var st = host.querySelector('.dst-status');
+        document.getElementById('hint').textContent =
+          '跳转前页面这条线 [' + before + '] → 跳转后 [' + lineNow() + ']；抽屉状态：' + (st ? st.textContent : '（没有状态条）');
+      }, 4200);
+    }
+    if (Q.get('demo') === 'zoom') {
+      // ?demo=zoom&to=5 —— 一路滚轮缩到 ≤5%，把"树到底还剩几个像素、有没有跑到画布外"写成数字
+      var cv3 = host.querySelector('.dst-canvas');
+      var lab3 = host.querySelector('.dst-zlabel');
+      var to = parseFloat(Q.get('to') || '5');
+      var guard = 0;
+      while (guard++ < 300 && parseFloat(lab3.textContent) > to) {
+        cv3.dispatchEvent(new WheelEvent('wheel', { deltaY: 100, clientX: 1600, clientY: 500, bubbles: true, cancelable: true }));
+      }
+      var cb = cv3.getBoundingClientRect();
+      var u = null, tiny = 0, off = 0, n = 0;
+      Array.prototype.forEach.call(host.querySelectorAll('.dst-card'), function (c) {
+        var b = c.getBoundingClientRect();
+        n++;
+        if (b.width < 1 || b.height < 1) tiny++;
+        if (b.right < cb.left || b.left > cb.right || b.bottom < cb.top || b.top > cb.bottom) off++;
+        if (!u) u = { l: b.left, t: b.top, r: b.right, b: b.bottom };
+        u.l = Math.min(u.l, b.left); u.t = Math.min(u.t, b.top);
+        u.r = Math.max(u.r, b.right); u.b = Math.max(u.b, b.bottom);
+      });
+      var inn = host.querySelector('.dst-inner').style.transform;
+      setTimeout(function () {
+        document.getElementById('hint').textContent = '缩到 [' + lab3.textContent + ']（目标 ' + to + '%，滚 ' + guard + ' 下）：' +
+          n + ' 张卡整体占位 ' + Math.round(u.r - u.l) + '×' + Math.round(u.b - u.t) + 'px @(' + Math.round(u.l) + ',' + Math.round(u.t) + ')，' +
+          '画布 ' + Math.round(cb.width) + '×' + Math.round(cb.height) + '；宽或高不足 1px 的卡 ' + tiny + ' 张，完全跑出画布的卡 ' + off + ' 张；transform=[' + inn + ']';
+      }, 80);
+    }
+  }, 900);
+}
+</script>
+</body>
+</html>

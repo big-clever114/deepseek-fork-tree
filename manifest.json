@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek 分叉树",
+  "version": "0.1.16",
+  "description": "把 DeepSeek 网页里所有「重新生成 / 重新编辑」产生的隐藏版本摊成一棵分叉树，随时找到并跳回任意一版。",
+  "permissions": ["storage"],
+  "host_permissions": ["https://chat.deepseek.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["src/capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["src/model.js", "src/layout.js", "src/drawer.js", "src/content.js"],
+      "css": ["src/drawer.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "显示 / 隐藏分叉树"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  }
+}
